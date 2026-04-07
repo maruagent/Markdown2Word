@@ -1,14 +1,19 @@
 import sys
 import os
+import re
 import tempfile
 import pypandoc
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from datetime import datetime
 
+# 🌟 追加: Wordを直接プログラムから操作するためのライブラリ
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.oxml.ns import qn
+
 
 def resource_path(relative_path):
-    """実行ファイル(.exe)化された時に、内包されたファイルのパスを取得する魔法の関数"""
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -17,28 +22,86 @@ def resource_path(relative_path):
 
 
 def get_templates():
-    """templatesフォルダ内の.docxファイル一覧を取得"""
     templates_dir = resource_path("templates")
     templates = {}
-
-    # style.docx（デフォルト）があれば追加
     default_style = resource_path("style.docx")
     if os.path.exists(default_style):
         templates["デフォルト (style.docx)"] = default_style
-
-    # templatesフォルダがあればその中の.docxを追加
     if os.path.exists(templates_dir):
         for f in sorted(os.listdir(templates_dir)):
             if f.endswith(".docx"):
                 name = os.path.splitext(f)[0]
                 templates[name] = os.path.join(templates_dir, f)
-
     return templates
 
 
+def fix_markdown_syntax(text):
+    """
+    【前処理】
+    #のあとにスペースがない場合、自動でスペースを補完する。
+    例: '#見出し' -> '# 見出し'
+    これでMarkdownの文法エラーによる変換失敗を完全に防ぎます。
+    """
+    return re.sub(r'^(#{1,6})([^#\s])', r'\1 \2', text, flags=re.MULTILINE)
+
+
+def apply_custom_styles(docx_path):
+    """
+    【後処理】
+    Pandocが出力したWordファイルを開き、要求通りのスタイルを強制的に上書きします。
+    """
+    doc = Document(docx_path)
+
+    # ── 1. 標準スタイル (游明朝・10.5pt) ──
+    if 'Normal' in doc.styles:
+        style = doc.styles['Normal']
+        style.font.size = Pt(10.5)
+        style.font.name = '游明朝'
+        # 日本語フォントを強制適用するためのXMLハック
+        if style.font.element.rPr is None:
+            style.font.element.get_or_add_rPr()
+        style.font.element.rPr.rFonts.set(qn('w:eastAsia'), '游明朝')
+
+    # ── 2. 見出し 1 (青色・太字・18pt) ──
+    if 'Heading 1' in doc.styles:
+        style = doc.styles['Heading 1']
+        style.font.size = Pt(18)
+        style.font.bold = True
+        style.font.color.rgb = RGBColor(0, 112, 192) # 青
+
+    # ── 3. 見出し 2 (紺色・太字・14pt) ──
+    if 'Heading 2' in doc.styles:
+        style = doc.styles['Heading 2']
+        style.font.size = Pt(14)
+        style.font.bold = True
+        style.font.color.rgb = RGBColor(0, 32, 96) # 紺
+
+    # ── 4. 見出し 3 (黒・太字・12pt) ──
+    if 'Heading 3' in doc.styles:
+        style = doc.styles['Heading 3']
+        style.font.size = Pt(12)
+        style.font.bold = True
+        style.font.color.rgb = RGBColor(0, 0, 0) # 黒
+
+    # ── 5. 表のスタイル (ヘッダー行に色付け) ──
+    # Wordの標準デザイン「Light Shading Accent 1 (薄い網かけ - アクセント 1)」を適用
+    for table in doc.tables:
+        try:
+            table.style = 'Light Shading Accent 1'
+        except KeyError:
+            try:
+                table.style = 'Table Grid' # フォールバック
+            except:
+                pass
+
+    # 上書き保存
+    doc.save(docx_path)
+
+
 def convert(markdown_text, ref_file, out_file):
-    """MarkdownテキストをWordに変換する"""
-    # 一時的なMarkdownファイルを作成して変換
+    # 1. ユーザーのMarkdown入力ミスを自動修正
+    markdown_text = fix_markdown_syntax(markdown_text)
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", delete=False, encoding="utf-8"
     ) as tmp:
@@ -46,24 +109,21 @@ def convert(markdown_text, ref_file, out_file):
         tmp_path = tmp.name
 
     try:
+        # 2. PandocでWordに変換
+        args = ["-f", "markdown", "-V", "lang=ja-JP"]
         if ref_file and os.path.exists(ref_file):
-            pypandoc.convert_file(
-                tmp_path,
-                "docx",
-                outputfile=out_file,
-                extra_args=[
-                    "-f",
-                    "markdown-yaml_metadata_block",
-                    f"--reference-doc={ref_file}",
-                ],
-            )
-        else:
-            pypandoc.convert_file(
-                tmp_path,
-                "docx",
-                outputfile=out_file,
-                extra_args=["-f", "markdown-yaml_metadata_block"],
-            )
+            args.append(f"--reference-doc={ref_file}")
+
+        pypandoc.convert_file(
+            tmp_path,
+            "docx",
+            outputfile=out_file,
+            extra_args=args,
+        )
+        
+        # 3. 生成されたWordファイルをプログラムで直接装飾（最強の解決策）
+        apply_custom_styles(out_file)
+
     finally:
         os.unlink(tmp_path)
 
@@ -71,13 +131,12 @@ def convert(markdown_text, ref_file, out_file):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Markdown → Word 変換")
+        self.title("Markdown → Word 自動装飾変換")
         self.resizable(True, True)
-        self.minsize(600, 500)
+        self.minsize(650, 500)
         self._build_ui()
         self._load_templates()
 
-        # ドラッグ&ドロップまたはコマンドライン引数でファイルが渡された場合
         if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
             self._load_md_file(sys.argv[1])
 
@@ -85,7 +144,7 @@ class App(tk.Tk):
         pad = {"padx": 10, "pady": 5}
 
         # ── Markdownテキストエリア ──────────────────────────
-        frame_md = tk.LabelFrame(self, text="Markdownテキスト", **pad)
+        frame_md = tk.LabelFrame(self, text="Markdownテキスト (※ # の後のスペース忘れは自動補完されます)", **pad)
         frame_md.pack(fill="both", expand=True, **pad)
 
         btn_frame = tk.Frame(frame_md)
@@ -103,7 +162,7 @@ class App(tk.Tk):
         self.text_area.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
         # ── テンプレート選択 ────────────────────────────────
-        frame_tmpl = tk.LabelFrame(self, text="テンプレート (style.docx)", **pad)
+        frame_tmpl = tk.LabelFrame(self, text="テンプレート (※指定なしでも自動で美しく装飾されます)", **pad)
         frame_tmpl.pack(fill="x", **pad)
 
         tmpl_inner = tk.Frame(frame_tmpl)
@@ -148,11 +207,11 @@ class App(tk.Tk):
     def _load_templates(self):
         self.templates = get_templates()
         names = list(self.templates.keys())
-        self.template_combo["values"] = names if names else ["(テンプレートなし)"]
+        self.template_combo["values"] = names if names else ["(自動装飾のみ)"]
         if names:
             self.template_combo.current(0)
         else:
-            self.template_var.set("(テンプレートなし)")
+            self.template_var.set("(自動装飾のみ)")
 
     def _paste_clipboard(self):
         try:
@@ -175,7 +234,6 @@ class App(tk.Tk):
         with open(path, encoding="utf-8") as f:
             self.text_area.delete("1.0", "end")
             self.text_area.insert("1.0", f.read())
-        # 出力ファイル名をMDファイル名ベースに設定
         base = os.path.splitext(os.path.basename(path))[0]
         self.out_var.set(os.path.join(os.path.dirname(path), base))
         self.status_var.set(f"読み込み完了: {os.path.basename(path)}")
@@ -211,7 +269,6 @@ class App(tk.Tk):
             filetypes=[("Wordファイル", "*.docx")],
         )
         if path:
-            # 拡張子を除いて保存
             self.out_var.set(os.path.splitext(path)[0])
 
     def _run_convert(self):
@@ -220,11 +277,9 @@ class App(tk.Tk):
             messagebox.showwarning("入力なし", "Markdownテキストを入力または貼り付けてください。")
             return
 
-        # テンプレート解決
         selected = self.template_var.get()
         ref_file = self.templates.get(selected)
 
-        # 出力パス
         out_base = self.out_var.get().strip()
         if not out_base:
             out_base = self._default_filename()
@@ -233,7 +288,6 @@ class App(tk.Tk):
         else:
             out_file = out_base
 
-        # 出力ディレクトリが指定されていない場合はダウンロードフォルダ
         if not os.path.dirname(out_file):
             downloads_dir = os.path.expanduser("~/Downloads")
             if not os.path.exists(downloads_dir):
