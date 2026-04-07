@@ -54,12 +54,27 @@ class ModernApp(ctk.CTk):
 
         self.templates = {}
 
+        # フォント可用性チェック（メインスレッドで一度だけ実行）
+        self._body_font = self._detect_font("游明朝", "MS Mincho")
+
         self._build_ui()
         self._load_templates()
 
         # exeアイコンにD&Dされた時の全自動処理
-        if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        if len(sys.argv) > 1:
             self._handle_dnd(sys.argv[1])
+
+    # ──────────────────────────────────────────
+    # フォント検出
+    # ──────────────────────────────────────────
+    def _detect_font(self, preferred, fallback):
+        """システムにインストールされているフォントを確認して選択する"""
+        try:
+            from tkinter import font as tkfont
+            families = tkfont.families(self)
+            return preferred if preferred in families else fallback
+        except Exception:
+            return preferred  # 確認できない場合は希望フォントをそのまま試みる
 
     # ──────────────────────────────────────────
     # UI構築
@@ -175,17 +190,31 @@ class ModernApp(ctk.CTk):
             self._load_md_file(path)
 
     def _load_md_file(self, path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
-            self.textbox.delete("1.0", "end")
-            self.textbox.insert("1.0", content)
-            base = os.path.splitext(os.path.basename(path))[0]
-            out_dir = os.path.dirname(path)
-            self.out_var.set(os.path.join(out_dir, base))
-            self.status_var.set(f"読み込み完了: {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("読み込みエラー", f"ファイルの読み込みに失敗しました:\n{e}")
+        # UTF-8 → UTF-8 BOM付き → Shift_JIS の順で試行
+        content = None
+        for enc in ("utf-8", "utf-8-sig", "cp932"):
+            try:
+                with open(path, encoding=enc) as f:
+                    content = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+            except OSError as e:
+                messagebox.showerror("読み込みエラー", f"ファイルを開けませんでした:\n{e}")
+                return
+        if content is None:
+            messagebox.showerror(
+                "文字コードエラー",
+                "ファイルの文字コードを認識できませんでした。\n"
+                "UTF-8 または Shift_JIS で保存されたファイルを使用してください。"
+            )
+            return
+        self.textbox.delete("1.0", "end")
+        self.textbox.insert("1.0", content)
+        base = os.path.splitext(os.path.basename(path))[0]
+        out_dir = os.path.dirname(path)
+        self.out_var.set(os.path.join(out_dir, base))
+        self.status_var.set(f"読み込み完了: {os.path.basename(path)}")
 
     def _clear_text(self):
         self.textbox.delete("1.0", "end")
@@ -211,6 +240,16 @@ class ModernApp(ctk.CTk):
     # ──────────────────────────────────────────
     def _handle_dnd(self, file_path):
         """D&Dされたファイルを読み込み、0.5秒後に自動で変換をスタートする"""
+        if not os.path.isfile(file_path):
+            messagebox.showwarning("ファイルエラー", f"ファイルが見つかりません:\n{file_path}")
+            return
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in ('.md', '.txt', '.markdown'):
+            messagebox.showwarning(
+                "非対応ファイル",
+                f"Markdownファイル（.md）を指定してください。\n({os.path.basename(file_path)})"
+            )
+            return
         self._load_md_file(file_path)
         self.after(500, self._start_conversion)
 
@@ -235,10 +274,20 @@ class ModernApp(ctk.CTk):
         else:
             out_file = out_base + ".docx"
 
-        # 保存先フォルダが指定されていない場合はダウンロードフォルダへ
+        # 保存先フォルダが指定されていない場合はDownloadsフォルダへ
         if not os.path.dirname(out_file):
             downloads = os.path.expanduser("~/Downloads")
             out_file = os.path.join(downloads if os.path.exists(downloads) else os.path.expanduser("~"), out_file)
+
+        # 出力先フォルダが存在しない場合は作成する
+        out_dir = os.path.dirname(out_file)
+        if out_dir:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror("保存先エラー", f"出力フォルダを作成できませんでした:\n{e}")
+                self._reset_button()
+                return
 
         # テンプレート解決
         selected = self.template_var.get()
@@ -252,6 +301,7 @@ class ModernApp(ctk.CTk):
         ).start()
 
     def _process_conversion(self, text, out_file, ref_file):
+        tmp_path = None
         try:
             # #の後のスペース忘れを自動修正
             text = re.sub(r'^(#{1,6})([^#\s])', r'\1 \2', text, flags=re.MULTILINE)
@@ -266,7 +316,6 @@ class ModernApp(ctk.CTk):
                 extra_args.append(f"--reference-doc={ref_file}")
 
             pypandoc.convert_file(tmp_path, "docx", outputfile=out_file, extra_args=extra_args)
-            os.unlink(tmp_path)
 
             # python-docxでスタイルを上書き適用
             self._apply_styles(out_file)
@@ -275,8 +324,19 @@ class ModernApp(ctk.CTk):
 
         except Exception as e:
             err_msg = str(e)
-            self.after(0, lambda: messagebox.showerror("変換エラー", err_msg))
-            self.after(0, lambda: self._reset_button())
+            def _on_error():
+                messagebox.showerror("変換エラー", err_msg)
+                self._reset_button()
+                self.status_var.set("変換失敗")
+            self.after(0, _on_error)
+
+        finally:
+            # 変換成否にかかわらず一時ファイルを確実に削除
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _finish_success(self, out_file):
         self._reset_button()
@@ -298,13 +358,16 @@ class ModernApp(ctk.CTk):
         def get_style(name):
             return doc.styles[name] if name in doc.styles else doc.styles.add_style(name, 1)
 
-        # 標準 (游明朝・10.5pt)
+        # 標準 (游明朝 or フォールバック・10.5pt)
         s_norm = get_style('Normal')
         s_norm.font.size = Pt(10.5)
-        s_norm.font.name = '游明朝'
-        if s_norm.font.element.rPr is None:
-            s_norm.font.element.get_or_add_rPr()
-        s_norm.font.element.rPr.rFonts.set(qn('w:eastAsia'), '游明朝')
+        s_norm.font.name = self._body_font
+        try:
+            rPr = s_norm.font.element.get_or_add_rPr()
+            rFonts = rPr.get_or_add_rFonts()
+            rFonts.set(qn('w:eastAsia'), self._body_font)
+        except Exception:
+            pass  # XML操作に失敗してもフォント設定以外の処理は継続
 
         # 見出し1 (青・太字・18pt)
         s_h1 = get_style('Heading 1')
